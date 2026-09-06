@@ -28,6 +28,120 @@ export const tooltipAttrs = createBitsAttrs({
 const TooltipProviderContext = new Context<TooltipProviderState>("Tooltip.Provider");
 const TooltipRootContext = new Context<TooltipRootState>("Tooltip.Root");
 
+/**
+ * Defaults applied when a `Tooltip.Root` has no ancestor `Tooltip.Provider`.
+ * They mirror the `Tooltip.Provider` component's own prop defaults.
+ */
+export const TOOLTIP_PROVIDER_DEFAULTS = {
+	delayDuration: 700,
+	skipDelayDuration: 300,
+	disableCloseOnTriggerClick: false,
+	disableHoverableContent: false,
+	disabled: false,
+	ignoreNonKeyboardFocus: false,
+} as const;
+
+/**
+ * Global tooltip coordinator.
+ *
+ * One instance per realm, keyed on `globalThis` via `Symbol.for`, so every
+ * `Tooltip.Root` — across separate app instances, custom elements, or even
+ * separate bundle copies — coordinates through the same object. It owns what
+ * used to live per `Tooltip.Provider` instance: single-open enforcement, the
+ * skip-delay grace window, and the scroll-close listener.
+ */
+const tooltipCoordinatorKey = Symbol.for("bits-ui.tooltip.coordinator");
+
+class TooltipCoordinator {
+	/** Live Roots keyed by stable instance identity. */
+	readonly #roots = new Map<TooltipRootState, null>();
+	#lastCloseAt = 0;
+	#lastCloseSkipDelayDuration = 0;
+	#scrollCleanup: (() => void) | null = null;
+
+	#handleScroll = (e: Event) => {
+		const target = e.target;
+		if (!(target instanceof Element || target instanceof Document)) return;
+		for (const root of this.#roots.keys()) {
+			if (!root.opts.open.current) continue;
+			const triggerNode = root.triggerNode;
+			if (!triggerNode) continue;
+			if (target.contains(triggerNode)) {
+				root.handleClose();
+				return;
+			}
+		}
+	};
+
+	#ensureScrollListener() {
+		// One scroll listener while any Root is live: close an open Root whose
+		// trigger sits inside the scrolled container. Previously each Provider
+		// instance owned its own listener; the coordinator keeps Provider-less
+		// Roots covered too. Dropped again when the last Root unregisters, so
+		// nothing accumulates across mount/unmount cycles. Skipped where there
+		// is no `window` (SSR).
+		if (this.#scrollCleanup === null && typeof window !== "undefined") {
+			this.#scrollCleanup = on(window, "scroll", this.#handleScroll);
+		}
+	}
+
+	register = (root: TooltipRootState) => {
+		this.#roots.set(root, null);
+		this.#ensureScrollListener();
+	};
+
+	unregister = (root: TooltipRootState) => {
+		this.#roots.delete(root);
+		if (this.#roots.size === 0) {
+			this.#scrollCleanup?.();
+			this.#scrollCleanup = null;
+		}
+	};
+
+	/** Called when a Root's open state flips to true: enforce single-open. */
+	open = (root: TooltipRootState) => {
+		for (const other of this.#roots.keys()) {
+			if (other === root) continue;
+			if (other.opts.open.current) {
+				other.handleClose();
+			}
+		}
+	};
+
+	/** Called when a Root's open state flips to false: record the close. */
+	close = (root: TooltipRootState) => {
+		this.#lastCloseAt = Date.now();
+		this.#lastCloseSkipDelayDuration = root.skipDelayDuration;
+	};
+
+	isOpen = (root: TooltipRootState) => {
+		return root.opts.open.current;
+	};
+
+	/**
+	 * Whether a pending open should skip its delay: either another tooltip is
+	 * currently open (single-open switching stays instant), or the previous
+	 * close happened within that Root's `skipDelayDuration` grace window.
+	 */
+	shouldSkipDelay = () => {
+		if (
+			this.#lastCloseSkipDelayDuration > 0 &&
+			Date.now() - this.#lastCloseAt < this.#lastCloseSkipDelayDuration
+		) {
+			return true;
+		}
+		for (const root of this.#roots.keys()) {
+			if (root.opts.open.current) return true;
+		}
+		return false;
+	};
+}
+
+function getTooltipCoordinator(): TooltipCoordinator {
+	const global = globalThis as unknown as Record<symbol, TooltipCoordinator | undefined>;
+	return (global[tooltipCoordinatorKey] ??= new TooltipCoordinator());
+}
+
 type TooltipTriggerRecord = {
 	id: string;
 	node: HTMLElement | null;
@@ -158,69 +272,27 @@ export class TooltipProviderState {
 		return TooltipProviderContext.set(new TooltipProviderState(opts));
 	}
 	readonly opts: TooltipProviderStateOpts;
-	isOpenDelayed = $state<boolean>(true);
 	isPointerInTransit = simpleBox(false);
-	#timerFn: TimeoutFn<() => void>;
-	#openTooltip = $state<TooltipRootState | null>(null);
 
 	constructor(opts: TooltipProviderStateOpts) {
 		this.opts = opts;
-		this.#timerFn = new TimeoutFn(() => {
-			this.isOpenDelayed = true;
-		}, this.opts.skipDelayDuration.current);
-
-		onMountEffect(() =>
-			on(window, "scroll", (e) => {
-				const activeTooltip = this.#openTooltip;
-				if (!activeTooltip) return;
-				const triggerNode = activeTooltip.triggerNode;
-				if (!triggerNode) return;
-
-				const target = e.target;
-				if (!(target instanceof Element || target instanceof Document)) return;
-
-				if (target.contains(triggerNode)) {
-					activeTooltip.handleClose();
-				}
-			})
-		);
 	}
 
-	#startTimer = () => {
-		const skipDuration = this.opts.skipDelayDuration.current;
-
-		if (skipDuration === 0) {
-			// no grace period — reset immediately so next trigger waits the full delay
-			this.isOpenDelayed = true;
-			return;
-		} else {
-			this.#timerFn.start();
-		}
-	};
-
-	#clearTimer = () => {
-		this.#timerFn.stop();
-	};
-
+	/**
+	 * The Provider's coordination entry points delegate to the shared
+	 * coordinator, so single-tree semantics are unchanged while Roots without a
+	 * Provider coordinate through the same object.
+	 */
 	onOpen = (tooltip: TooltipRootState) => {
-		if (this.#openTooltip && this.#openTooltip !== tooltip) {
-			this.#openTooltip.handleClose();
-		}
-
-		this.#clearTimer();
-		this.isOpenDelayed = false;
-		this.#openTooltip = tooltip;
+		getTooltipCoordinator().open(tooltip);
 	};
 
 	onClose = (tooltip: TooltipRootState) => {
-		if (this.#openTooltip === tooltip) {
-			this.#openTooltip = null;
-			this.#startTimer();
-		}
+		getTooltipCoordinator().close(tooltip);
 	};
 
 	isTooltipOpen = (tooltip: TooltipRootState) => {
-		return this.#openTooltip === tooltip;
+		return getTooltipCoordinator().isOpen(tooltip);
 	};
 }
 
@@ -241,30 +313,50 @@ interface TooltipRootStateOpts
 
 export class TooltipRootState {
 	static create(opts: TooltipRootStateOpts) {
-		return TooltipRootContext.set(new TooltipRootState(opts, TooltipProviderContext.get()));
+		return TooltipRootContext.set(
+			new TooltipRootState(opts, TooltipProviderContext.getOr(null))
+		);
 	}
 	readonly opts: TooltipRootStateOpts;
-	readonly provider: TooltipProviderState;
+	readonly provider: TooltipProviderState | null;
 	readonly delayDuration = $derived.by(
-		() => this.opts.delayDuration.current ?? this.provider.opts.delayDuration.current
+		() =>
+			this.opts.delayDuration.current ??
+			this.provider?.opts.delayDuration.current ??
+			TOOLTIP_PROVIDER_DEFAULTS.delayDuration
 	);
 	readonly disableHoverableContent = $derived.by(
 		() =>
 			this.opts.disableHoverableContent.current ??
-			this.provider.opts.disableHoverableContent.current
+			this.provider?.opts.disableHoverableContent.current ??
+			TOOLTIP_PROVIDER_DEFAULTS.disableHoverableContent
 	);
 	readonly disableCloseOnTriggerClick = $derived.by(
 		() =>
 			this.opts.disableCloseOnTriggerClick.current ??
-			this.provider.opts.disableCloseOnTriggerClick.current
+			this.provider?.opts.disableCloseOnTriggerClick.current ??
+			TOOLTIP_PROVIDER_DEFAULTS.disableCloseOnTriggerClick
 	);
 	readonly disabled = $derived.by(
-		() => this.opts.disabled.current ?? this.provider.opts.disabled.current
+		() =>
+			this.opts.disabled.current ??
+			this.provider?.opts.disabled.current ??
+			TOOLTIP_PROVIDER_DEFAULTS.disabled
 	);
 	readonly ignoreNonKeyboardFocus = $derived.by(
 		() =>
 			this.opts.ignoreNonKeyboardFocus.current ??
-			this.provider.opts.ignoreNonKeyboardFocus.current
+			this.provider?.opts.ignoreNonKeyboardFocus.current ??
+			TOOLTIP_PROVIDER_DEFAULTS.ignoreNonKeyboardFocus
+	);
+	/**
+	 * Effective `skipDelayDuration` for this Root. Roots cannot override it, so
+	 * it is the enclosing Provider's value, or the default when Provider-less.
+	 */
+	readonly skipDelayDuration = $derived.by(
+		() =>
+			this.provider?.opts.skipDelayDuration.current ??
+			TOOLTIP_PROVIDER_DEFAULTS.skipDelayDuration
 	);
 	readonly registry: TooltipTriggerRegistryState;
 	readonly tether: TooltipTetherState | null;
@@ -272,12 +364,13 @@ export class TooltipRootState {
 	contentPresence: PresenceManager;
 	#wasOpenDelayed = $state(false);
 	#timerFn: TimeoutFn<() => void>;
+	#coordinator: TooltipCoordinator;
 	readonly stateAttr = $derived.by(() => {
 		if (!this.opts.open.current) return "closed";
 		return this.#wasOpenDelayed ? "delayed-open" : "instant-open";
 	});
 
-	constructor(opts: TooltipRootStateOpts, provider: TooltipProviderState) {
+	constructor(opts: TooltipRootStateOpts, provider: TooltipProviderState | null) {
 		this.opts = opts;
 		this.provider = provider;
 		this.tether = opts.tether.current?.state ?? null;
@@ -286,6 +379,16 @@ export class TooltipRootState {
 			this.#wasOpenDelayed = true;
 			this.opts.open.current = true;
 		}, this.delayDuration ?? 0);
+
+		// Self-register with the coordinator for the lifetime of this Root,
+		// mirroring the tether registration pattern below.
+		this.#coordinator = getTooltipCoordinator();
+		this.#coordinator.register(this);
+		onMountEffect(() => {
+			return () => {
+				this.#coordinator.unregister(this);
+			};
+		});
 
 		if (this.tether) {
 			this.tether.root = this;
@@ -322,9 +425,9 @@ export class TooltipRootState {
 			(isOpen) => {
 				if (isOpen) {
 					this.ensureActiveTrigger();
-					this.provider.onOpen(this);
+					this.#coordinator.open(this);
 				} else {
-					this.provider.onClose(this);
+					this.#coordinator.close(this);
 				}
 			},
 			{ lazy: true }
@@ -367,7 +470,7 @@ export class TooltipRootState {
 	#handleDelayedOpen = () => {
 		this.#timerFn.stop();
 
-		const shouldSkipDelay = !this.provider.isOpenDelayed;
+		const shouldSkipDelay = this.#coordinator.shouldSkipDelay();
 		const delayDuration = this.delayDuration ?? 0;
 
 		// if no delay needed (either skip delay active or delay is 0), open immediately
@@ -654,12 +757,12 @@ export class TooltipTriggerState {
 		if (e.pointerType === "touch") return;
 
 		// if in transit, wait briefly to see if user is actually heading to old content or staying here
-		if (root.provider.isPointerInTransit.current) {
+		if (root.provider?.isPointerInTransit.current) {
 			this.#clearTransitCheck();
 			this.#transitCheckTimeout = window.setTimeout(() => {
 				// if still in transit after delay, user is likely staying on this trigger
-				if (root.provider.isPointerInTransit.current) {
-					root.provider.isPointerInTransit.current = false;
+				if (root.provider?.isPointerInTransit.current) {
+					if (root.provider) root.provider.isPointerInTransit.current = false;
 					root.onTriggerEnter(this.opts.id.current);
 					this.#hasPointerMoveOpened = true;
 				}
@@ -685,7 +788,7 @@ export class TooltipTriggerState {
 
 		// moving within trigger means we're definitely not in transit anymore
 		this.#clearTransitCheck();
-		root.provider.isPointerInTransit.current = false;
+		if (root.provider) root.provider.isPointerInTransit.current = false;
 
 		root.onTriggerEnter(this.opts.id.current);
 		this.#hasPointerMoveOpened = true;
@@ -709,7 +812,7 @@ export class TooltipTriggerState {
 		if (isElement(relatedTarget)) {
 			for (const record of root.registry.triggers.values()) {
 				if (record.node !== relatedTarget) continue;
-				if (root.provider.opts.skipDelayDuration.current > 0) {
+				if (root.skipDelayDuration > 0) {
 					this.#hasPointerMoveOpened = false;
 					return;
 				}
@@ -807,7 +910,7 @@ export class TooltipContentState {
 			ignoredTargets: () => {
 				// only skip closing for sibling triggers when there's a skip-delay grace period;
 				// with skipDelayDuration=0 the close+reopen is intentional (full delay + re-animation)
-				if (this.root.provider.opts.skipDelayDuration.current === 0) return [];
+				if (this.root.skipDelayDuration === 0) return [];
 				const nodes: HTMLElement[] = [];
 				const activeTriggerNode = this.root.triggerNode;
 				for (const record of this.root.registry.triggers.values()) {
@@ -818,7 +921,7 @@ export class TooltipContentState {
 				return nodes;
 			},
 			onPointerExit: () => {
-				if (this.root.provider.isTooltipOpen(this.root)) {
+				if (this.root.opts.open.current) {
 					this.root.handleClose();
 				}
 			},
